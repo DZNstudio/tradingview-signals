@@ -1,0 +1,201 @@
+//@version=5
+// =====================================================================
+// THEO TRADING SIGNALS  (Phase 2 of Theo Finance)
+// Notification / signal tool for Michael and Dominika. NOT financial advice,
+// NOT auto-trading. Signals are to be reviewed and run past an accredited
+// adviser before any action. Built from Michael's stated rules; to be refined
+// against the Oliver Kel strategy once the book is supplied.
+//
+// Rules (Michael's, v1.2):
+//   SIGNAL = a 4-tick checklist. Each condition scores a tick, green for buy / red for sell:
+//     1) RSI        (oversold = buy / overbought = sell)
+//     2) 10/20 cross(10 above 20 = buy / below = sell)
+//     3) Bollinger  (below lower band = buy / above upper = sell)
+//     4) 200 MA     (price above = buy / below = sell)
+//   3 of 4 green => BUY ; 3 of 4 red => SELL (threshold configurable).
+//   10 EMA = red, 20 EMA = blue (Oliver Kell style). Default MA = EMA.
+//   CYCLE (beta): names the current Kell stage (EMA Crossback, Base 'n Break 1/2,
+//   Exhaustion Extension, Wedge Drop, Reversal Extension, Wedge Pop), the bull/bear
+//   leg, and what comes next. Heuristic for now; to be tightened against the book.
+// =====================================================================
+indicator("Theo Trading Signals", overlay = true, max_labels_count = 500)
+
+// ----- Inputs -----
+grpR   = "RSI"
+rsiLen = input.int(14, "RSI length", group = grpR)
+obLvl  = input.int(70, "Overbought (sell)", group = grpR)
+osLvl  = input.int(30, "Oversold (buy)", group = grpR)
+rsiLook= input.int(10, "RSI must hit its level within N bars of the cross", group = grpR)
+
+grpB   = "Bollinger Bands"
+bbLen  = input.int(20, "Length", group = grpB)
+bbMult = input.float(2.0, "Std-dev multiplier", step = 0.1, group = grpB)
+
+grpM   = "Weekly moving averages"
+maType = input.string("EMA", "MA type", options = ["SMA", "EMA"], group = grpM)
+len200 = input.int(200, "Long MA (weeks)", group = grpM)
+lenFast= input.int(10,  "Fast MA (weeks)", group = grpM)
+lenSlow= input.int(20,  "Slow MA (weeks)", group = grpM)
+useWk  = input.bool(true, "Measure these MAs on the weekly timeframe", group = grpM, tooltip = "On: the 200/10/20 are true weekly MAs no matter what timeframe your chart is on. Off: they use the chart's own timeframe.")
+
+grpS   = "Signals"
+confirm = input.bool(true, "Only fire on a closed bar (less repaint)", group = grpS)
+needTicks = input.int(3, "Green ticks needed to call BUY / SELL (out of 4)", minval = 2, maxval = 4, group = grpS)
+
+grpC   = "Oliver Kell cycle (beta)"
+exhExt = input.float(4.0, "Exhaustion / reversal stretch (ATRs from the 10 MA)", step = 0.5, group = grpC)
+crossN = input.int(3, "Bars after a cross still counted as 'EMA Crossback'", group = grpC)
+
+// ----- MA helper -----
+ma(src, len) => maType == "EMA" ? ta.ema(src, len) : ta.sma(src, len)
+
+// ----- Weekly MAs + cross flags (computed on the weekly timeframe) -----
+tf = useWk ? "W" : timeframe.period
+[w200, wFast, wSlow, wBull, wBear] = request.security(syminfo.tickerid, tf,
+     [ ma(close, len200),
+       ma(close, lenFast),
+       ma(close, lenSlow),
+       ta.crossover (ma(close, lenFast), ma(close, lenSlow)),
+       ta.crossunder(ma(close, lenFast), ma(close, lenSlow)) ],
+     lookahead = barmerge.lookahead_off)
+
+// ----- RSI and Bollinger (on the chart timeframe) -----
+rsi   = ta.rsi(close, rsiLen)
+basis = ta.sma(close, bbLen)
+dev   = bbMult * ta.stdev(close, bbLen)
+upper = basis + dev
+lower = basis - dev
+
+// ----- Signal logic: 4-condition tick checklist -----
+aboveUpper = close > upper
+belowLower = close < lower
+rsiWasOB = ta.highest(rsi, rsiLook) > obLvl   // RSI hit overbought within N bars
+rsiWasOS = ta.lowest(rsi, rsiLook)  < osLvl   // RSI hit oversold within N bars
+
+// the four conditions, buy-side and its mirror sell-side
+buRsi = rsiWasOS
+seRsi = rsiWasOB
+buX   = wFast > wSlow
+seX   = wFast < wSlow
+buBB  = belowLower
+seBB  = aboveUpper
+buMA  = close > w200
+seMA  = close < w200
+
+buScore = (buRsi ? 1 : 0) + (buX ? 1 : 0) + (buBB ? 1 : 0) + (buMA ? 1 : 0)
+seScore = (seRsi ? 1 : 0) + (seX ? 1 : 0) + (seBB ? 1 : 0) + (seMA ? 1 : 0)
+
+ready    = confirm ? barstate.isconfirmed : true
+buyState = buScore >= needTicks
+selState = seScore >= needTicks
+buySig   = buyState and ready and not buyState[1]   // fire when it first reaches the threshold
+sellSig  = selState and ready and not selState[1]
+bullX    = wBull and ready
+bearX    = wBear and ready
+
+// ----- Oliver Kell price-cycle stage (BETA heuristic, to tighten with the book) -----
+atr   = ta.atr(14)
+bull  = wFast > wSlow
+ext   = atr > 0 ? (close - wFast) / atr : 0.0          // how stretched price is from the 10 MA, in ATRs
+brkUp = bull and close > ta.highest(close[1], 10)       // new 10-bar high in an up leg
+brkDn = not bull and close < ta.lowest(close[1], 10)    // new 10-bar low in a down leg
+sinceBull = ta.barssince(wBull)
+sinceBear = ta.barssince(wBear)
+
+var int bnb = 0
+if wBull or wBear
+    bnb := 0
+if brkUp or brkDn
+    bnb := bnb + 1
+
+stage = "building"
+if bull
+    if ext > exhExt and (rsi > obLvl or rsiWasOB)
+        stage := "Exhaustion Extension"
+    else if sinceBull <= crossN
+        stage := "EMA Crossback (bull)"
+    else if wFast < wFast[3] and close < wFast
+        stage := "Wedge Drop (topping)"
+    else if brkUp
+        stage := "Base 'n Break " + str.tostring(bnb) + " (breakout)"
+    else
+        stage := "Base 'n Break " + str.tostring(bnb + 1) + " (basing)"
+else
+    if ext < -exhExt and (rsi < osLvl or rsiWasOS)
+        stage := "Reversal Extension"
+    else if sinceBear <= crossN
+        stage := "EMA Crossback (bear)"
+    else if wFast > wFast[3] and close > wFast
+        stage := "Wedge Pop (bottoming)"
+    else if brkDn
+        stage := "Base 'n Break " + str.tostring(bnb) + " down (break)"
+    else
+        stage := "Base 'n Break " + str.tostring(bnb + 1) + " down (basing)"
+
+nextStage = "building"
+if str.contains(stage, "Crossback") and bull
+    nextStage := "Base 'n Break"
+else if str.contains(stage, "Base 'n Break") and bull
+    nextStage := "more bases -> Exhaustion Extension"
+else if stage == "Exhaustion Extension"
+    nextStage := "Wedge Drop (the top)"
+else if str.contains(stage, "Wedge Drop")
+    nextStage := "bear leg -> Reversal Extension"
+else if stage == "Reversal Extension"
+    nextStage := "Wedge Pop (the bottom)"
+else if str.contains(stage, "Wedge Pop")
+    nextStage := "bull leg -> EMA Crossback"
+else if str.contains(stage, "Crossback") and not bull
+    nextStage := "Base 'n Break down"
+else if str.contains(stage, "Base 'n Break") and not bull
+    nextStage := "more bases -> Reversal Extension"
+
+// ----- Plots -----
+plot(w200,  "200 MA (long)", color = color.orange, linewidth = 2)
+plot(wFast, "10 MA (fast)",  color = color.red,  linewidth = 2)
+plot(wSlow, "20 MA (slow)",  color = color.blue, linewidth = 2)
+pu = plot(upper, "BB upper", color = color.new(color.gray, 55))
+pl = plot(lower, "BB lower", color = color.new(color.gray, 55))
+fill(pu, pl, color = color.new(color.gray, 92), title = "BB fill")
+
+plotshape(buySig,  "BUY signal",  shape.labelup,   location.belowbar, color.new(color.green, 0), text = "BUY",  textcolor = color.white, size = size.small)
+plotshape(sellSig, "SELL signal", shape.labeldown, location.abovebar, color.new(color.red, 0),   text = "SELL", textcolor = color.white, size = size.small)
+plotshape(bullX, "10>20 bull cross", shape.triangleup,   location.belowbar, color.new(color.green, 35), size = size.tiny)
+plotshape(bearX, "10<20 bear cross", shape.triangledown, location.abovebar, color.new(color.red, 35),   size = size.tiny)
+bgcolor(sellSig ? color.new(color.red, 85) : buySig ? color.new(color.green, 85) : na, title = "Signal tint")
+
+// ----- Panel (top-right): 4-tick checklist + Kell cycle stage -----
+var table t = table.new(position.top_right, 2, 9, border_width = 1, frame_width = 1, frame_color = color.gray)
+if barstate.islast
+    verdict = buyState ? "BUY" : selState ? "SELL" : "WAIT"
+    vcol    = buyState ? color.green : selState ? color.red : color.gray
+    sil = color.silver
+    wht = color.white
+    grn = color.green
+    red = color.red
+    table.cell(t, 0, 0, "THEO", text_color = wht, bgcolor = color.new(color.blue, 10))
+    table.cell(t, 1, 0, verdict + "   B" + str.tostring(buScore) + " / S" + str.tostring(seScore), text_color = wht, bgcolor = color.new(vcol, 10))
+    table.cell(t, 0, 1, "RSI " + str.tostring(rsi, "#.0"), text_color = sil, text_halign = text.align_left)
+    table.cell(t, 1, 1, buRsi ? "✔ buy" : seRsi ? "✔ sell" : "–",   text_color = buRsi ? grn : seRsi ? red : sil, text_halign = text.align_right)
+    table.cell(t, 0, 2, "10/20 cross", text_color = sil, text_halign = text.align_left)
+    table.cell(t, 1, 2, buX ? "✔ buy (10>20)" : "✔ sell (10<20)",   text_color = buX ? grn : red, text_halign = text.align_right)
+    table.cell(t, 0, 3, "Bollinger", text_color = sil, text_halign = text.align_left)
+    table.cell(t, 1, 3, buBB ? "✔ buy (below)" : seBB ? "✔ sell (above)" : "– inside", text_color = buBB ? grn : seBB ? red : sil, text_halign = text.align_right)
+    table.cell(t, 0, 4, "200 MA", text_color = sil, text_halign = text.align_left)
+    table.cell(t, 1, 4, buMA ? "✔ buy (above)" : "✔ sell (below)",  text_color = buMA ? grn : red, text_halign = text.align_right)
+    table.cell(t, 0, 5, "Leg",   text_color = sil, text_halign = text.align_left)
+    table.cell(t, 1, 5, bull ? "BULL (10>20)" : "BEAR (10<20)",     text_color = bull ? grn : red, text_halign = text.align_right)
+    table.cell(t, 0, 6, "Stage", text_color = sil, text_halign = text.align_left)
+    table.cell(t, 1, 6, stage,   text_color = wht, text_halign = text.align_right)
+    table.cell(t, 0, 7, "Next",  text_color = sil, text_halign = text.align_left)
+    table.cell(t, 1, 7, nextStage, text_color = color.aqua, text_halign = text.align_right)
+    table.cell(t, 0, 8, "needs", text_color = sil, text_halign = text.align_left)
+    table.cell(t, 1, 8, str.tostring(needTicks) + " of 4 ticks", text_color = sil, text_halign = text.align_right)
+
+// ----- Alerts (create these in TradingView -> Alerts -> condition = this indicator) -----
+alertcondition(buySig,  title = "Theo BUY signal",       message = "Theo BUY on {{ticker}} ({{interval}}): 3+ of 4 ticks green (RSI, 10/20 cross, Bollinger, 200MA). Close {{close}}. Review before acting.")
+alertcondition(sellSig, title = "Theo SELL signal",      message = "Theo SELL on {{ticker}} ({{interval}}): 3+ of 4 ticks red (RSI, 10/20 cross, Bollinger, 200MA). Close {{close}}. Review before acting.")
+alertcondition(bullX,   title = "Theo 10/20 bull cross", message = "Theo: 10-week MA crossed ABOVE the 20-week on {{ticker}}. Close {{close}}.")
+alertcondition(bearX,   title = "Theo 10/20 bear cross", message = "Theo: 10-week MA crossed BELOW the 20-week on {{ticker}}. Close {{close}}.")
+// One alert to rule them all (fires on any buy/sell):
+alertcondition(buySig or sellSig, title = "Theo BUY or SELL", message = "Theo signal on {{ticker}} ({{interval}}). Open the chart. Review before acting.")
